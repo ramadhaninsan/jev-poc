@@ -164,10 +164,15 @@ def _mercari_perceive(page):
         if page.query_selector(sel):
             elements.append(Element("searchbox", "search input", "TextField"))
             break
-    # Listing cards: anchors to /item/ whose text carries a JPY price.
-    for i, a in enumerate(page.query_selector_all("a[href*='/item/']")[:40]):
+    cards = [a for i, a in enumerate(page.query_selector_all("a[href*='/item/']")[:40])]
+    for i, a in enumerate(cards):
         t = (a.inner_text() or "").strip()
+        # Auction exclusion (D-1): Mercari auctions carry bid/auction markers the
+        # fixed-price tiles do not. Skip any card whose text shows them, so only
+        # buy-now listings are judged.
         if t and re.search(r"[¥￥]\s*[\d,]+", t):
+            if any(m in t for m in ("入札", "オークション", "落札", "現在")):
+                continue
             elements.append(Element(f"prod{i}", t[:90], "Listing"))
     if not elements:
         # Fall back to a text-stream pass keyed on ¥-price lines.
@@ -179,8 +184,8 @@ def _mercari_perceive(page):
                 elements.append(Element(f"prod{len(elements)}", f"{prev} / {l[:40]}", "Listing"))
                 if len(elements) >= 40:
                     break
-    print(f"[mercari_perceive] {len(elements)} elements "
-          f"({sum(1 for e in elements if e.role=='Listing')} Listing)")
+    ns = len([e for e in elements if e.role == "Listing"])
+    print(f"[mercari_perceive] {len(elements)} elements ({ns} Listing)")
     return elements
 
 
@@ -196,6 +201,38 @@ def _mercari_product_links(page):
         if h2 and h2 not in seen:
             seen.append(h2)
     return seen
+
+
+def _mercari_listings(page):
+    """Structured fixed-price listings from the grid.
+
+    Returns [{raw, asking_jpy, url, img_url}]. Reads the FULL anchor text (the
+    90-char Element label truncates and can cut the [M6a 126/103] number),
+    extracts asking JPY, and captures the thumbnail image URL for grading.
+    Excludes auctions (bid/auction markers).
+    """
+    out = []
+    seen_urls = set()
+    cards = page.query_selector_all("a[href*='/item/']")
+    for a in cards[:50]:
+        t = (a.inner_text() or "").strip()
+        if not t or not re.search(r"[¥￥]\s*[\d,]+", t):
+            continue
+        if any(m in t for m in ("入札", "オークション", "落札", "現在")):
+            continue  # auction
+        href = (a.get_attribute("href") or "").split("?")[0]
+        if not href or href in seen_urls:
+            continue
+        seen_urls.add(href)
+        m = re.search(r"[¥￥]\s*([\d,]+)", t)
+        asking = int(m.group(1).replace(",", "")) if m else None
+        img = ""
+        try:
+            img = a.query_selector("img").get_attribute("src") or ""
+        except Exception:
+            pass
+        out.append({"raw": t, "asking_jpy": asking, "url": "https://jp.mercari.com" + href, "img_url": img})
+    return out
 
 
 def _snkrdunk_product_links(page):

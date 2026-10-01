@@ -22,6 +22,49 @@ OPENROUTER = "https://openrouter.ai/api/alpha/decisions"
 JEV_MODEL  = os.environ.get("JEV_MODEL", "typesafe/jev-1.13")
 JD = os.environ.get("OPENROUTER_API_KEY", "")
 
+STEAL_THRESHOLD = 0.70   # asking <= market * this  => STEAL  (owner "-30% for example")
+JPY_PER_USD     = 150    # known approximation; live FX is future work (recorded debt)
+POPULAR_MIN_LISTINGS = 100  # optional data-refresh popularity proxy, unused in v1
+
+# ---------------------------------------------------------------------------
+# HOT_SEED — fan-favorite pokemon (owner decision 2026-10-01), exploded into
+# card-variant matchers. HOT <=> matched card is in here AND verdict == STEAL.
+# Each entry matches against the TCGplayer candidate's fields (name/set/rarity).
+# Built on affinity (OG 151 + legendaries + fan favorites), NOT market volume.
+# ---------------------------------------------------------------------------
+HOT_SEED = [
+    # --- Pikachu line / Charizard line / starters (fan-favorite core) ---
+    {"name": "Pikachu", "rarity": "Special Illustration Rare"},
+    {"name": "Charizard", "rarity": "Special Illustration Rare"},
+    {"name": "Charizard", "rarity": "Illustration Rare"},
+    {"name": "Charizard", "set": "Base"},           # vintage base set 4/102
+    {"name": "Charizard", "set": "151"},
+    {"name": "Blastoise", "set": "Base"},
+    {"name": "Venusaur", "set": "Base"},
+    {"name": "Umbreon"},                             # Eevee line fan fave
+    {"name": "Sylveon"},
+    {"name": "Espeon"},
+    # --- Legends / mythicals ---
+    {"name": "Mewtwo", "set": "Base"},               # vintage
+    {"name": "Mew"},
+    {"name": "Lugia", "set": "Neo"},                 # vintage
+    {"name": "Ho-Oh", "set": "Neo"},
+    {"name": "Rayquaza"},
+    {"name": "Garchomp"},
+    {"name": "Giratina"},
+    {"name": "Arceus"},
+    # --- Fan favorites ---
+    {"name": "Gengar", "set": "Fossil"},             # vintage
+    {"name": "Gengar"},
+    {"name": "Lucario"},
+    {"name": "Greninja"},
+    {"name": "Mimikyu"},
+    {"name": "Gyarados", "set": "Base"},             # vintage
+    {"name": "Dragonite"},
+    {"name": "Snorlax"},
+    {"name": "Lapras"},
+]
+
 TCG_SEARCH_BODY = {"algorithm":"sales_dismax","from":0,"size":24,
   "filters":{"term":{"productLineName":["pokemon"],"setName":["product"]},"range":{},"match":{}},
   "listingSearch":{"context":{"cart":{"packages":{}}},
@@ -153,31 +196,142 @@ def match_card(identity, candidates, en_set_map=None):
     return top[1]
 
 # ---------------------------------------------------------------------------
-# Stage 2: Jev verdict (asking vs matched market)
+# Stage 2: DETERMINISTIC STEAL verdict + HOT + grade annotation (no Jev in the
+# pure threshold — it is arithmetic). Grade is ANNOTATION, not a gate (D-COND-BAR).
 # ---------------------------------------------------------------------------
+def is_hot(matched):
+    """Fan-favorite check: is the matched card one of the HOT_SEED variants?"""
+    if not matched:
+        return False
+    name = (matched.get("name") or "").lower()
+    rar = (matched.get("rarity") or "").lower()
+    setn = (matched.get("set") or "").lower()
+    for seed in HOT_SEED:
+        if seed.get("name", "").lower() not in name:
+            continue
+        if seed.get("rarity") and seed["rarity"].lower() not in rar:
+            continue
+        if seed.get("set") and seed["set"].lower() not in setn:
+            continue
+        return True
+    return False
+
+
 def _jev_call(questions, state):
-    body=json.dumps({"model":JEV_MODEL,"state":state,"questions":questions}).encode()
-    req=urllib.request.Request(OPENROUTER, data=body,
-        headers={"Authorization":f"Bearer {JD}","Content-Type":"application/json"})
-    with urllib.request.urlopen(req,timeout=30) as r:
+    body = json.dumps({"model": JEV_MODEL, "state": state, "questions": questions}).encode()
+    req = urllib.request.Request(OPENROUTER, data=body,
+        headers={"Authorization": f"Bearer {JD}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read().decode())["answers"]
 
-def verdict(listing, matched):
-    asking_usd = round(listing['asking_jpy']/150,2)
-    state = {"marketplace_listing":{**listing,"asking_price_usd_approx":asking_usd},
-             "confirmed_market_card":{
-                "name":matched.get('name'),"set":matched.get('set'),"rarity":matched.get('rarity'),
-                "market_price_usd":matched.get('market'),"lowest_price_usd":matched.get('low'),
-                "live_listings":matched.get('listings')},
-             "note":"TCGplayer market USD vs marketplace asking converted ~150 JPY/USD."}
-    questions={"verdict":{"type":"choice","criteria":{
-        "STEAL":"Asking is meaningfully BELOW the confirmed card's market price. Alert the user.",
-        "MARKET":"About fair market value. Do not alert.",
-        "OVERPRICED":"Asking is above market. Do not alert."},
-        "instructions":"Decide verdict vs the confirmed card's market price."},
-        "alert":{"type":"noul","instructions":"Send to user (clear steal AND sold_out=false)?"}}
-    a=_jev_call(questions, state)
-    return a.get("verdict",{}).get("choice"), a.get("alert",{}).get("noul",0.0)
+
+def assess_verdict(asking_jpy, matched):
+    """Return {verdict, pct_below} — pure function, no network, no Jev.
+
+    verdict: STEAL | MARKET | OVERPRICED | SKIP(market missing).
+    Uses marketPrice, falls back to lowestPrice; none => SKIP (no guess).
+    PNG market is USD, asking is JPY -> convert with JPY_PER_USD.
+    """
+    market = matched.get("market") if matched.get("market") is not None else matched.get("low")
+    if market is None or market <= 0:
+        return {"verdict": "SKIP", "pct_below": None}
+    asking_usd = asking_jpy / JPY_PER_USD
+    pct_below = (market - asking_usd) / market
+    if asking_usd <= market * STEAL_THRESHOLD:
+        v = "STEAL"
+    elif asking_usd <= market:
+        v = "MARKET"
+    else:
+        v = "OVERPRICED"
+    return {"verdict": v, "pct_below": pct_below, "asking_usd": asking_usd}
+
+
+def _vision_condition(img_url):
+    """Read a card photo -> text condition profile via a vision model.
+
+    Tries deepseek-v4-flash-vision-exp over OpenRouter chat/completions. Returns
+    a short text profile (or None on failure). Kept separate so a grade read
+    failure NEVER drops a STEAL (grade is annotation only).
+    """
+    if not img_url or not JD:
+        return None
+    body = json.dumps({
+        "model": "deepseek/deepseek-v4-flash-vision-exp",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": ("Describe the visible condition of this Pokemon card "
+                                      "for grading: surface whitening, corner/edge wear, "
+                                      "scratches, dents, centering, print/foil issues. "
+                                      "One short sentence.")},
+            {"type": "image_url", "image_url": {"url": img_url}},
+        ]}],
+    }).encode()
+    req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions", data=body,
+                                 headers={"Authorization": f"Bearer {JD}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return None
+
+
+def _jev_grade_question(profile):
+    ans = _jev_call({
+        "grade": {"type": "choice", "criteria": {
+            "NM": "Near Mint: clean surface, sharp corners/edges, no whitening or wear",
+            "LP": "Lightly Played: minor edge/surface wear, small whitening on corners",
+            "PLAYED": "Played: visible wear, whitening/edge scuffs, light scratches",
+            "HP": "Heavily Played: significant wear, creases/dings/scratches, faded",
+        }, "instructions": "Pick the card's condition grade from the vision profile. Be strict."},
+        "vintage": {"type": "noul", "instructions": "Is this an older/vintage-era card (>~15y)?"},
+    }, {"card_condition_observed": profile})
+    g = ans.get("grade", {}).get("choice", "NM")
+    if g not in ("NM", "LP", "PLAYED", "HP"):
+        g = "NM"
+    return g, ans.get("vintage", {}).get("noul", 0.0) >= 0.5
+
+
+def grade_card(img_url, profile=None):
+    """grade = vision profile -> Jev condition class + vintage flag.
+
+    Returns {grade, vintage} or {grade:"NM", vintage:False} default on failure
+    (never raises; annotation only).
+    """
+    profile = profile or _vision_condition(img_url)
+    if profile is None:
+        return {"grade": "UNKNOWN", "vintage": False, "profile": None}
+    try:
+        g, v = _jev_grade_question(profile)
+        return {"grade": g, "vintage": v, "profile": profile}
+    except Exception:
+        return {"grade": "UNKNOWN", "vintage": False, "profile": profile}
+
+
+def assess(listing, matched, grade=None):
+    """Full assessment for one listing. Returns the row dict.
+
+    listing: {name|raw, asking_jpy, url, img_url}
+    grade : optional {grade, vintage}; if None, skipped (no image path here).
+    """
+    row = {
+        "card": (listing.get("name") or listing.get("raw") or "")[:60],
+        "url": listing.get("url", ""),
+        "asking_jpy": listing.get("asking_jpy"),
+        "market": matched.get("market") if matched else None,
+        "low": matched.get("low") if matched else None,
+        "matched_name": (matched.get("name") if matched else None),
+        "matched_set": (matched.get("set") if matched else None),
+        "matched_rarity": (matched.get("rarity") if matched else None),
+        "grade": grade.get("grade") if grade else None,
+        "vintage": grade.get("vintage") if grade else False,
+    }
+    r = assess_verdict(listing.get("asking_jpy", 0) or 0, matched or {})
+    row["verdict"] = r["verdict"]
+    row["pct_below"] = r["pct_below"]
+    hot = is_hot(matched)
+    row["hot"] = hot
+    if r["verdict"] == "STEAL" and hot:
+        row["verdict"] = "HOT"
+    return row
 
 # ---------------------------------------------------------------------------
 # L1: sample Mercari-style listing detail strings (precision test set)
@@ -193,26 +347,88 @@ def sample_listings():
         ("ピカチュウ [M6a 136/103] 30th CELEBRATION", 3500, False),                        # plain common -> match-able
     ]
 
+def process_listing(raw, asking_jpy, url="", img_url="", do_grade=False):
+    """Run one listing through the pipeline. Returns a row dict or None (skip)."""
+    idn = parse_identity(raw)
+    if idn is None:
+        return {"card": raw[:60], "url": url, "asking_jpy": asking_jpy,
+                "verdict": "SKIP", "reason": "identity unsafe/uncertain"}
+    q = f"{idn['en_name']} {idn['en_set']}".strip() or idn['en_name']
+    cands = tcg_candidates(q)
+    matched = match_card(idn, cands)
+    if matched is None:
+        return {"card": raw[:60], "url": url, "asking_jpy": asking_jpy,
+                "verdict": "SKIP", "reason": "no confident TCGplayer match"}
+    listing = {"name": raw, "edition": idn["edition"], "number": idn["number"],
+               "asking_jpy": asking_jpy, "url": url, "img_url": img_url}
+    grade = grade_card(img_url) if do_grade and img_url else None
+    return assess(listing, matched, grade=grade)
+
+
+def feed(listings, do_grade=True):
+    """Iterate structured listings (from _mercari_listings) through the pipeline."""
+    rows = []
+    for L in listings:
+        row = process_listing(L.get("raw", ""), L.get("asking_jpy", 0),
+                              url=L.get("url", ""), img_url=L.get("img_url", ""),
+                              do_grade=do_grade)
+        rows.append(row)
+    return rows
+
+
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--live", default="",
+                    help="Mercari search URL -> browse with playwright, feed the "
+                         "gate, print STEAL/HOT rows (grades annotations via vision+Jev).")
+    ap.add_argument("--no-grade", action="store_true", help="skip the image grade call")
+    args = ap.parse_args()
+
+    if args.live:
+        if not JD:
+            print("OPENROUTER_API_KEY not set (needed for grade/Jev)"); sys.exit(1)
+        from playwright.sync_api import sync_playwright
+        from jev_agent import _mercari_listings  # structured extractor
+        import time
+        with sync_playwright() as p:
+            b = p.chromium.launch(headless=True)
+            ctx = b.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36", locale="ja-JP")
+            pg = ctx.new_page()
+            pg.goto(args.live, timeout=30000, wait_until="domcontentloaded")
+            deadline = 0
+            while deadline < 20:
+                if _mercari_listings(pg):
+                    break
+                pg.wait_for_timeout(1500); deadline += 1.5
+            pg.wait_for_timeout(1500)
+            listings = _mercari_listings(pg)
+        print(f"=== live Mercari feed: {len(listings)} fixed-price listings ===")
+        rows = feed(listings, do_grade=not args.no_grade)
+        for r in rows:
+            if r["verdict"] == "SKIP":
+                print(f"  [SKIP] {r['card'][:44]!r} ({r.get('reason','')})")
+                continue
+            g = r.get("grade"); vintage = "v" if r.get("vintage") else ""
+            print(f"  [{r['verdict']:<7}] {r['card'][:40]!r} asking ¥{r['asking_jpy']} "
+                  f"mkt ${r['market']} ({100*(r['pct_below'] or 0):+.0f}%) "
+                  f"grade={g}{vintage} hot={r['hot']} {r['url']}")
+        print("\n=== STEAL/HOT summary ===")
+        for r in [x for x in rows if x["verdict"] in ("STEAL", "HOT")]:
+            print(f"  {r['verdict']}: {r['card'][:44]!r} asking ¥{r['asking_jpy']} "
+                  f"mkt ${r['market']} grade={r.get('grade')} {r['url']}")
+        return
+
     if not JD:
-        print("OPENROUTEER_API_KEY not set"); sys.exit(1)
-    print("=== precision gate over Mercari-style listings ===")
+        print("OPENROUTER_API_KEY not set"); sys.exit(1)
+    print("=== precision gate over Mercari-style listings (sample, no grade) ===")
     for raw, asking, sold in sample_listings():
-        idn = parse_identity(raw)
-        if idn is None:
-            print(f"  [SKIP] {raw[:48]!r:-<54} (identity unsafe/uncertain)")
+        r = process_listing(raw, asking, do_grade=False)
+        if r["verdict"] == "SKIP":
+            print(f"  [SKIP] {raw[:48]!r:-<50} ({r.get('reason','')})")
             continue
-        q = f"{idn['en_name']} {idn['en_set']}".strip() or idn['en_name']
-        cands = tcg_candidates(q)
-        matched = match_card(idn, cands)
-        if matched is None:
-            print(f"  [SKIP] {raw[:48]!r:-<50} (no confident TCGplayer match)")
-            continue
-        listing = {"name":raw,"edition":idn["edition"],"number":idn["number"],
-                   "asking_jpy":asking,"sold_out":sold,"url":"#"}
-        v, alert = verdict(listing, matched)
-        print(f"  [evaluated] {raw[:44]!r} edition={idn['edition']} -> mkt ${matched.get('market')} "
-              f"verdict={v} alert={alert:.2f}")
+        print(f"  [evaluated] {raw[:44]!r} asking ¥{r['asking_jpy']} "
+              f"mkt ${r['market']} verdict={r['verdict']} hot={r['hot']}")
 
 if __name__ == "__main__":
     main()
