@@ -145,6 +145,59 @@ def _snkrdunk_perceive(page):
     return elements
 
 
+def _mercari_perceive(page):
+    """Perceive elements from a Mercari.jp search page.
+
+    Mirrors _snkrdunk_perceive: detail-page price evidence, search box, listing
+    cards. Mercari's search page is infinite-scroll: listing cards are anchors
+    to /item/<id> whose inner text contains a JPY price.
+    """
+    body = page.inner_text("body")
+    elements = []
+    # Product detail page: surface the price strongly so Jev can call DONE.
+    detail_price = re.search(r"[¥￥]\s*([\d,]+)", body)
+    if "/item/" in page.url and detail_price:
+        elements.append(Element("price", f"Product price is {detail_price.group(0)}", "PriceEvidence"))
+        return elements
+    # Mercari placeholder is 何をお探しですか？ -- does NOT contain 検索.
+    for sel in ("input[type='search']", "input[placeholder*='お探し']", "input[name='keyword']"):
+        if page.query_selector(sel):
+            elements.append(Element("searchbox", "search input", "TextField"))
+            break
+    # Listing cards: anchors to /item/ whose text carries a JPY price.
+    for i, a in enumerate(page.query_selector_all("a[href*='/item/']")[:40]):
+        t = (a.inner_text() or "").strip()
+        if t and re.search(r"[¥￥]\s*[\d,]+", t):
+            elements.append(Element(f"prod{i}", t[:90], "Listing"))
+    if not elements:
+        # Fall back to a text-stream pass keyed on ¥-price lines.
+        price = re.compile(r"[¥￥]\s*([\d,]+)")
+        lines = [l.strip() for l in body.split("\n") if l.strip()]
+        for i, l in enumerate(lines):
+            if price.search(l) and i > 0:
+                prev = lines[i - 1][:40]
+                elements.append(Element(f"prod{len(elements)}", f"{prev} / {l[:40]}", "Listing"))
+                if len(elements) >= 40:
+                    break
+    print(f"[mercari_perceive] {len(elements)} elements "
+          f"({sum(1 for e in elements if e.role=='Listing')} Listing)")
+    return elements
+
+
+def _mercari_product_links(page):
+    """Return (href) of the visible Mercari product-detail anchors, in order."""
+    hrefs = page.eval_on_selector_all(
+        "a[href*='/item/']",
+        "els => els.map(e => e.getAttribute('href'))",
+    )
+    seen = []
+    for h in hrefs:
+        h2 = h.split("?")[0]
+        if h2 and h2 not in seen:
+            seen.append(h2)
+    return seen
+
+
 def _snkrdunk_product_links(page):
     """Return (href) of the visible ranked product-detail anchors, in order."""
     hrefs = page.eval_on_selector_all(
@@ -167,7 +220,17 @@ def backend_playwright(search_url, perceive_fn, task):
         ctx = b.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36", locale="ja-JP")
         pg = ctx.new_page()
         pg.goto(search_url, timeout=30000, wait_until="domcontentloaded")
-        pg.wait_for_timeout(4000)
+        # Mercari's grid is lazy-loaded; wait until the perceiver actually sees
+        # listings before starting the loop, else Jev loops SCROLL_DOWN forever
+        # on an empty grid (the documented degenerate action).
+        deadline = 0
+        while deadline < 20:
+            probe = perceive_fn(pg) or []
+            if any(e.role == "Listing" for e in probe):
+                break
+            pg.wait_for_timeout(1500)
+            deadline += 1.5
+        pg.wait_for_timeout(1500)
         history = []
         for step in range(MAX_STEPS):
             elements = perceive_fn(pg) or []
@@ -226,11 +289,27 @@ def main():
     ap.add_argument("--url", default="https://snkrdunk.com/search?keyword=%E3%83%AA%E3%82%B6%E3%83%BC%E3%83%89%E3%83%B3")
     ap.add_argument("--task", default="Find the cheapest pokemon card listing on this page and identify its price")
     ap.add_argument("--backend", default="playwright")
+    ap.add_argument("--mercari", action="store_true",
+                    help="Target Mercari.jp (jp.mercari.com) instead of snkrdunk: "
+                         "use the Mercari perceiver + a リザードン search URL.")
     args = ap.parse_args()
     if not API_KEY:
         print("OPENROUTER_API_KEY not set"); sys.exit(1)
     if args.backend == "playwright":
-        backend_playwright(args.url, _snkrdunk_perceive, args.task)
+        if args.mercari:
+            perceive = _mercari_perceive
+            # --url has a non-empty snkrdunk default, so only use it if the
+            # user explicitly passed a Mercari URL; otherwise use the Mercari
+            # search default. (args.url or default would always hit snkrdunk.)
+            if args.url.startswith("https://jp.mercari.com"):
+                url = args.url
+            else:
+                url = "https://jp.mercari.com/search?keyword=%E3%83%AA%E3%82%B6%E3%83%BC%E3%83%89%E3%83%B3"
+            task = args.task or ("Scroll through the Mercari search results grid for "
+                                 "リザードン and keep loading more listings")
+            backend_playwright(url, perceive, task)
+        else:
+            backend_playwright(args.url, _snkrdunk_perceive, args.task)
     else:
         backend_jina(args.url, None)
 

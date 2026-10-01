@@ -2,6 +2,7 @@
 # Source the OpenRouter key then run the Jev-decision scraper PoC.
 set -a; source /root/.hermes/.env; set +a
 export JEV_MODEL="${JEV_MODEL:-typesafe/jev-1.13}"
-PYBIN=$(ls -d /root/.hermes/tools/python-3.14.7+*/bin/python3)
+# Playwright + chromium live in the x_image_daily venv (this host).
+PYBIN=/root/x_image_daily/venv/bin/python
 cd /root/jev-poc
 exec "$PYBIN" jev_agent.py "$@"
