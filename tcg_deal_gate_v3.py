@@ -78,6 +78,7 @@ TCG_SEARCH_BODY = {"algorithm":"sales_dismax","from":0,"size":24,
 # Edition tokens that appear in listing titles -> EN TCGplayer rarity.
 EDITION_TO_EN = {
     "SAR": "Special Illustration Rare", "SR": "Special Illustration Rare",
+    "SSR": "Special Illustration Rare", "SSP": "Special Illustration Rare",
     "UR": "Universe Rare", "AR": "Art Rare", "RR": "Double Rare",
     "PCG": "Pokemon Center", "H": "Holo", "": "",
 }
@@ -113,11 +114,25 @@ def parse_identity(raw):
     EN_TABLE = [
         (r'ピカチュウ', 'Pikachu'), (r'リザードン', 'Charizard'), (r'ミュウ', 'Mew'),
         (r'ミュウツー', 'Mewtwo'), (r'ルギア', 'Lugia'), (r'イーブイ', 'Eevee'),
-        (r'ホウオウ', 'Ho-Oh'), (r'せいなるはしら', ''),
+        (r'ホウオウ', 'Ho-Oh'), (r'カイリュー', 'Dragonite'), (r'カイロス', 'Pinsir'),
+        (r'ニョロモ', 'Poliwag'), (r'セレビィ', 'Celebi'), (r'せいなるはしら', ''),
+    ]
+    # JP set names -> EN (translates the query, not just the card name).
+    JP_SET = [
+        (r'スカーレット&バイオレット', 'Scarlet & Violet'), (r'スカーレット＆バイオレット', 'Scarlet & Violet'),
+        (r'ブラック&ホワイト', 'Black & White'), (r'ソード&シールド', 'Sword & Shield'),
+        (r'スーパーバーストデッキ', ''), (r'30th CELEBRATION', '151'), (r'30th', '151'),
+        (r'メガ拡張パック', ''), (r'拡張パック', ''), (r'ハイクラスパック', ''),
+        (r'ポケモンカードゲーム', ''), (r'ポケモンカード', ''), (r'プロモ', ''), (r'プロモカード', ''),
     ]
     for jp, en in EN_TABLE:
         en_name = re.sub(jp, en, en_name)
-    en_name = re.sub(r'(ex|V)\b', r' \1', en_name)      # Pikachuex -> Pikachu ex; PikachuV -> Pikachu V
+    for jp, en in JP_SET:
+        en_name = re.sub(jp, en + ' ', en_name)
+    en_name = re.sub(r'(ex|V|GX)\b', r' \1', en_name)          # Pikachuex -> Pikachu ex
+    # drop any REMAINING CJK (untranslated set/flavor text) + card numbers from the query
+    en_name = re.sub(r'[\u3040-\u30ff\u4e00-\u9fff\u3000-\u303f]+', ' ', en_name)
+    en_name = re.sub(r'\b\d+\s*/\s*\d+\b', ' ', en_name)       # 331/190 -> drop
     en_name = re.sub(r'\s+', ' ', en_name).strip()
     # strip the edition/rarity token out of the NAME (it belongs in edition, not the query)
     for tok in EDITION_TO_EN:
@@ -141,16 +156,24 @@ def tcg_search(q):
     return d['results'][0]['results']
 
 def tcg_candidates(query, n=8):
-    out=[]
+    out = []
+    # products that are NOT a single card and must never be a match target
+    NON_CARD_PRODUCT = ("tin", "mini tin", "booster", "bundle", "case", "etb",
+                        "elite trainer", "collection", "figure", "misc", "sleeve",
+                        "pokeball", "box", "5-pack", "pack", "display", "uprc",
+                        "ultra premium", "starter deck", "theme deck", "deck")
     try:
         for it in tcg_search(query)[:n]:
             if it.get('marketPrice') is None and it.get('lowestPrice') is None:
                 continue
-            out.append({'id':int(it['productId']),'name':it.get('productName'),'set':it.get('setName'),
-                        'rarity':it.get('rarityName'),'market':it.get('marketPrice'),
-                        'low':it.get('lowestPrice'),'listings':int(it.get('totalListings') or 0)})
+            pn = (it.get('productName') or '').lower()
+            if any(k in pn for k in NON_CARD_PRODUCT):
+                continue  # tins/boxes/collections are never a single card
+            out.append({'id': int(it['productId']), 'name': it.get('productName'), 'set': it.get('setName'),
+                        'rarity': it.get('rarityName'), 'market': it.get('marketPrice'),
+                        'low': it.get('lowestPrice'), 'listings': int(it.get('totalListings') or 0)})
     except Exception as e:
-        out.append({'error':str(e)})
+        out.append({'error': str(e)})
     return out
 
 # ---------------------------------------------------------------------------
@@ -169,30 +192,36 @@ def match_card(identity, candidates, en_set_map=None):
     valid = [c for c in candidates if not c.get('error')]
     if not valid:
         return None
-    want_edition = identity.get('edition','').strip().lower()
-    name = re.sub(r'\b(?:SAR|SR|UR|AR|RR)\b.*','', identity.get('en_name', identity['name'])).strip()
+    want_edition = identity.get('edition', '').strip().lower()
+    name = re.sub(r'\b(?:SAR|SR|SSR|SSP|UR|AR|RR)\b.*', '', identity.get('en_name', identity['name'])).strip()
     scored = []
     for c in valid:
         s = 0.0
         # edition is the precision gate: a SAR must match a SIR candidate, else heavily penalize
         if want_edition:
             c_ed = (c.get('rarity') or '').lower()
-            ed_match = (('sar' in want_edition or 'sr' in want_edition)
+            ed_match = (('sar' in want_edition or 'sr' in want_edition or 'ssr' in want_edition or 'ssp' in want_edition)
                         and ('special illustration' in c_ed)) or \
                        (want_edition == 'cov' and 'cover' in c_ed)
             s += 3.0 if ed_match else -2.0
         s += _jaccard(name, c.get('name'))            # name similarity
-        # candidate must at least mention the card name word
-        if name.lower().split()[0][:3] not in c.get('name','').lower():
+        # candidate must at least mention the top card-name word
+        head = name.split()[0][:3] if name.split() else ''
+        if head and head not in c.get('name', '').lower():
             s -= 1.5
         scored.append((s, c))
     scored.sort(key=lambda x: -x[0])
-    if len(scored) < 2:
-        return None  # not enough evidence to be confident -> SKIP
-    top, second = scored[0], scored[1]
-    # confident only if clear margin AND the top isn't a box/misc
-    if top[0] < 2.0 or top[0] - second[0] < 0.5:
-        return None   # tied or weak -> SKIP (do NOT guess)
+    if not scored:
+        return None
+    top = scored[0]
+    # Confidence bar depends on whether edition constrained the match: an edition-
+    # gated candidate needs the old strict 2.0; a bare name match (no edition) still
+    # needs a clear lead, but jaccard alone rarely reaches 2.0 -> lower to 0.6.
+    need = 2.0 if want_edition else 0.6
+    if top[0] < need:
+        return None
+    if len(scored) >= 2 and top[0] - scored[1][0] < 0.5:
+        return None   # tied -> SKIP (do NOT guess)
     return top[1]
 
 # ---------------------------------------------------------------------------
